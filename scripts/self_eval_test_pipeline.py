@@ -19,6 +19,7 @@ sys.path.append(parent_dir)
 # Import our custom modules
 from scripts.question_classifier import classify_question
 from scripts.retriever import TextRetriever
+from scripts.reranker import rerank_passages  # Import the new reranker
 
 # Initialize colorama for colored terminal output
 init()
@@ -160,11 +161,22 @@ def evaluate_system() -> Dict[str, Any]:
         }
     }
     
+    # Track results with and without custom reranker
+    reranker_results = {
+        "question_type_accuracy": 0,
+        "keyword_coverage": 0,
+        "relevance_rate": 0,
+        "overall_score": 0
+    }
+    
     # Process each test question
     total_questions = len(test_questions)
     correct_types = 0
     total_coverage = 0
     total_relevance = 0
+    
+    reranker_total_coverage = 0
+    reranker_total_relevance = 0
     
     for i, test_case in enumerate(test_questions, 1):
         question = test_case["question"]
@@ -186,41 +198,77 @@ def evaluate_system() -> Dict[str, Any]:
         # Step 2: Retrieve passages
         passages = retriever.retrieve_relevant_passages(
             query=question,
-            top_k=3,
+            top_k=5,  # Retrieve more for better reranking chances
             use_reranking=True
         )
         
-        # Step 3: Evaluate top passage
+        # Step 3: Apply our custom reranker
+        reranked_passages = rerank_passages(question, passages, expected_keywords)
+        
+        # Step 4: Evaluate both original and reranked passages
         passage_result = {
             "question": question,
             "expected_type": expected_type,
             "predicted_type": predicted_type,
             "type_correct": type_correct,
-            "passages": []
+            "original_passages": [],
+            "reranked_passages": []
         }
         
-        top_passage_coverage = 0
-        relevance = False
+        # Evaluate original top passage
+        original_top_coverage = 0
+        original_relevance = False
         
-        for j, passage in enumerate(passages, 1):
+        if passages:
+            keyword_check = check_keyword_coverage(passages[0]["text"], expected_keywords)
+            is_relevant = is_passage_relevant(passages[0]["text"], question)
+            original_top_coverage = keyword_check["coverage"]
+            original_relevance = is_relevant
+            if original_relevance:
+                total_relevance += 1
+        
+        # Evaluate reranked top passage
+        reranked_top_coverage = 0
+        reranked_relevance = False
+        
+        if reranked_passages:
+            reranked_keyword_check = check_keyword_coverage(reranked_passages[0]["text"], expected_keywords)
+            reranked_is_relevant = is_passage_relevant(reranked_passages[0]["text"], question)
+            reranked_top_coverage = reranked_keyword_check["coverage"]
+            reranked_relevance = reranked_is_relevant
+            if reranked_relevance:
+                reranker_total_relevance += 1
+            
+            # Add the results for reranked passages
+            reranker_total_coverage += reranked_top_coverage
+        
+        # Print comparison between original and reranked results
+        print(f"\n{Fore.CYAN}Comparison of Retrieval Methods:{Style.RESET_ALL}")
+        print(f"Original Top Passage Keyword Coverage: {original_top_coverage:.2f}")
+        print(f"Reranked Top Passage Keyword Coverage: {reranked_top_coverage:.2f}")
+        
+        coverage_diff = reranked_top_coverage - original_top_coverage
+        if coverage_diff > 0:
+            print(f"Improvement with Reranker: {Fore.GREEN}+{coverage_diff:.2f}{Style.RESET_ALL}")
+        elif coverage_diff < 0:
+            print(f"Change with Reranker: {Fore.RED}{coverage_diff:.2f}{Style.RESET_ALL}")
+        else:
+            print(f"No change in keyword coverage")
+        
+        # Display detailed passage information (using reranked passages)
+        for j, passage in enumerate(reranked_passages, 1):
             # Check keyword coverage
             keyword_check = check_keyword_coverage(passage["text"], expected_keywords)
             
             # Check if passage is relevant
             is_relevant = is_passage_relevant(passage["text"], question)
-            if j == 1:
-                relevance = is_relevant
-                if relevance:
-                    total_relevance += 1
-                top_passage_coverage = keyword_check["coverage"]
             
             # Add passage results
-            passage_result["passages"].append({
+            passage_result["reranked_passages"].append({
                 "rank": j,
                 "text": passage["text"],
                 "section": passage["section"],
                 "paragraph_index": passage["paragraph_index"],
-                "score": passage["score"],
                 "keyword_coverage": keyword_check["coverage"],
                 "matched_keywords": keyword_check["matched_keywords"],
                 "is_relevant": is_relevant
@@ -229,7 +277,7 @@ def evaluate_system() -> Dict[str, Any]:
             # Print passage evaluation
             relevance_text = f"{Fore.GREEN}Relevant{Style.RESET_ALL}" if is_relevant else f"{Fore.RED}Possibly Off-Topic{Style.RESET_ALL}"
             
-            print(f"\nPassage {j}: (Section: {passage['section']}, Para: {passage['paragraph_index']})")
+            print(f"\nReranked Passage {j}: (Section: {passage['section']}, Para: {passage['paragraph_index']})")
             text_preview = passage["text"][:200] + "..." if len(passage["text"]) > 200 else passage["text"]
             print(f"Text: {text_preview}")
             
@@ -241,26 +289,34 @@ def evaluate_system() -> Dict[str, Any]:
             
             print(f"Relevance: {relevance_text}")
             print(f"Coverage Score: {keyword_check['coverage']:.2f}")
+            
+            # If this passage has a keyword_score from our reranker, show it
+            if 'keyword_score' in passage:
+                print(f"Reranker Score: {passage['keyword_score']:.2f}")
         
         # Calculate aggregate score for this question (70% keyword coverage, 30% correct type)
-        question_score = (0.7 * top_passage_coverage) + (0.3 * int(type_correct))
-        score_icon = generate_score_icon(question_score)
+        original_question_score = (0.7 * original_top_coverage) + (0.3 * int(type_correct))
+        reranked_question_score = (0.7 * reranked_top_coverage) + (0.3 * int(type_correct))
+        
+        score_icon = generate_score_icon(reranked_question_score)
         
         # Generate feedback
-        feedback = generate_feedback(type_correct, top_passage_coverage, relevance)
+        feedback = generate_feedback(type_correct, reranked_top_coverage, reranked_relevance)
         
-        print(f"\n{Fore.CYAN}OVERALL QUESTION SCORE: {question_score:.2f} {score_icon}{Style.RESET_ALL}")
+        print(f"\n{Fore.CYAN}ORIGINAL QUESTION SCORE: {original_question_score:.2f}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}RERANKED QUESTION SCORE: {reranked_question_score:.2f} {score_icon}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}FEEDBACK: {feedback}{Style.RESET_ALL}")
         
         # Add to results
-        passage_result["score"] = question_score
+        passage_result["original_score"] = original_question_score
+        passage_result["reranked_score"] = reranked_question_score
         passage_result["feedback"] = feedback
         results["questions"].append(passage_result)
         
         # Update overall metrics
-        total_coverage += top_passage_coverage
+        total_coverage += original_top_coverage
     
-    # Calculate overall metrics
+    # Calculate original metrics
     results["metrics"]["question_type_accuracy"] = correct_types / total_questions
     results["metrics"]["keyword_coverage"] = total_coverage / total_questions
     results["metrics"]["relevance_rate"] = total_relevance / total_questions
@@ -268,26 +324,54 @@ def evaluate_system() -> Dict[str, Any]:
                                           0.4 * results["metrics"]["keyword_coverage"] +
                                           0.3 * results["metrics"]["relevance_rate"])
     
-    # Print overall results
+    # Calculate reranker metrics
+    reranker_results["question_type_accuracy"] = correct_types / total_questions
+    reranker_results["keyword_coverage"] = reranker_total_coverage / total_questions
+    reranker_results["relevance_rate"] = reranker_total_relevance / total_questions
+    reranker_results["overall_score"] = (0.3 * reranker_results["question_type_accuracy"] + 
+                                        0.4 * reranker_results["keyword_coverage"] +
+                                        0.3 * reranker_results["relevance_rate"])
+    
+    # Add reranker results to the results dictionary
+    results["reranker_metrics"] = reranker_results
+    
+    # Print overall results with comparison
     print(f"\n{Fore.CYAN}======================================{Style.RESET_ALL}")
     print(f"{Fore.CYAN}OVERALL EVALUATION RESULTS{Style.RESET_ALL}")
     print(f"{Fore.CYAN}======================================{Style.RESET_ALL}")
+    
+    # Original metrics
+    print(f"{Fore.YELLOW}Original Retriever:{Style.RESET_ALL}")
     print(f"Question Type Accuracy: {results['metrics']['question_type_accuracy']:.2f}")
     print(f"Keyword Coverage: {results['metrics']['keyword_coverage']:.2f}")
     print(f"Relevance Rate: {results['metrics']['relevance_rate']:.2f}")
     print(f"Overall Score: {results['metrics']['overall_score']:.2f} {generate_score_icon(results['metrics']['overall_score'])}")
     
+    # Reranker metrics
+    print(f"\n{Fore.YELLOW}With Custom Reranker:{Style.RESET_ALL}")
+    print(f"Question Type Accuracy: {reranker_results['question_type_accuracy']:.2f}")
+    print(f"Keyword Coverage: {reranker_results['keyword_coverage']:.2f}")
+    print(f"Relevance Rate: {reranker_results['relevance_rate']:.2f}")
+    print(f"Overall Score: {reranker_results['overall_score']:.2f} {generate_score_icon(reranker_results['overall_score'])}")
+    
+    # Calculate and show improvement
+    improvement = reranker_results['overall_score'] - results['metrics']['overall_score']
+    if improvement > 0:
+        print(f"\n{Fore.GREEN}Improvement with Reranker: +{improvement:.2f} ({improvement*100:.1f}%){Style.RESET_ALL}")
+    else:
+        print(f"\n{Fore.RED}Change with Reranker: {improvement:.2f} ({improvement*100:.1f}%){Style.RESET_ALL}")
+    
     # Generate system improvement suggestions
     print(f"\n{Fore.YELLOW}SYSTEM IMPROVEMENT SUGGESTIONS:{Style.RESET_ALL}")
     
-    if results["metrics"]["question_type_accuracy"] < 0.7:
+    if reranker_results["question_type_accuracy"] < 0.7:
         print("- Tune question classifier to better match expected types")
     
-    if results["metrics"]["keyword_coverage"] < 0.7:
+    if reranker_results["keyword_coverage"] < 0.7:
         print("- Improve embedding model or switch to a more domain-specific model")
-        print("- Enhance reranking based on concept overlap")
+        print("- Further enhance keyword-based reranking algorithms")
     
-    if results["metrics"]["relevance_rate"] < 0.7:
+    if reranker_results["relevance_rate"] < 0.7:
         print("- Add contextual relevance scoring")
         print("- Explore query expansion to improve matching")
     
