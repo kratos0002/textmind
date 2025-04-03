@@ -12,6 +12,37 @@ except ImportError:
     import sys
     sys.exit(1)
 
+# Strong definition patterns (direct override)
+definition_overrides = [
+    r"^what is ", r"^what are ", r"^who is ", r"^who are ",
+    r"^what does .+ mean", r"^define "
+]
+
+# Strong argument patterns (direct override)
+argument_overrides = [
+    r"^why ", r"^what reason", r"^for what reason", 
+    r"what causes", r"what caused", r"how does .+ explain",
+    r"what factors", r"what is the reasoning"
+]
+
+# Strong context patterns (direct override)
+context_overrides = [
+    r"^when was", r"^when did", r"^where was", r"^where did",
+    r"^in what year", r"^during what period"
+]
+
+# Strong evidence patterns (direct override)
+evidence_overrides = [
+    r"^what evidence", r"^what examples", r"^what facts",
+    r"^what data", r"^what observations"
+]
+
+# Strong analogy patterns (direct override)
+analogy_overrides = [
+    r"^how does .+ compare", r"^what similarities", 
+    r"^how is .+ similar to", r"^what parallels", r"^how does .+ contrast"
+]
+
 def rule_based_classification(question: str) -> Union[str, None]:
     """
     Apply rule-based classification based on question patterns.
@@ -24,37 +55,6 @@ def rule_based_classification(question: str) -> Union[str, None]:
         The category as a string, or None if no rule matches strongly
     """
     question_lower = question.lower()
-    
-    # Strong definition patterns (direct override)
-    definition_overrides = [
-        r"^what is ", r"^what are ", r"^who is ", r"^who are ",
-        r"^what does .+ mean", r"^define "
-    ]
-    
-    # Strong argument patterns (direct override)
-    argument_overrides = [
-        r"^why ", r"^what reason", r"^for what reason", 
-        r"what causes", r"what caused", r"how does .+ explain",
-        r"what factors", r"what is the reasoning"
-    ]
-    
-    # Strong context patterns (direct override)
-    context_overrides = [
-        r"^when was", r"^when did", r"^where was", r"^where did",
-        r"^in what year", r"^during what period"
-    ]
-    
-    # Strong evidence patterns (direct override)
-    evidence_overrides = [
-        r"^what evidence", r"^what examples", r"^what facts",
-        r"^what data", r"^what observations"
-    ]
-    
-    # Strong analogy patterns (direct override)
-    analogy_overrides = [
-        r"^how does .+ compare", r"^what similarities", 
-        r"^how is .+ similar to", r"^what parallels", r"^how does .+ contrast"
-    ]
     
     # Check for exact pattern matches with direct overrides
     for pattern in definition_overrides:
@@ -80,7 +80,7 @@ def rule_based_classification(question: str) -> Union[str, None]:
     # No strong rule match - return None for ML fallback
     return None
 
-def classify_question(question: str, model_name: str = "facebook/bart-large-mnli") -> str:
+def classify_question(question: str, model_name: str = "facebook/bart-large-mnli") -> Union[str, Dict[str, Any]]:
     """
     Classify a question into one of the predefined categories using a hybrid approach:
     1. First try rule-based classification for high-confidence patterns
@@ -95,13 +95,54 @@ def classify_question(question: str, model_name: str = "facebook/bart-large-mnli
                    - 'microsoft/deberta-v2-xlarge-mnli'
     
     Returns:
-        The predicted category as a string
+        Either just the predicted category as string (for backward compatibility)
+        or a dict with category and scores if return_confidence=True
     """
+    # Default confidence scores
+    all_scores = {
+        "Definition": 0.0,
+        "Context": 0.0,
+        "Argument": 0.0,
+        "Evidence": 0.0,
+        "Analogy": 0.0
+    }
+    
+    # Track if we used rule-based classification
+    used_rule_based = False
+    rule_name = None
+    
     # First, try rule-based classification
     rule_result = rule_based_classification(question)
     if rule_result:
-        # We have a high-confidence rule match, return it directly
-        return rule_result
+        # We have a high-confidence rule match, mark it with a high confidence
+        predicted_category = rule_result
+        all_scores[predicted_category] = 0.99  # High confidence for rule-based match
+        used_rule_based = True
+        
+        # Determine which rule was used
+        question_lower = question.lower()
+        
+        # Check each pattern set to see which one matched
+        if any(re.search(pattern, question_lower) for pattern in definition_overrides):
+            rule_name = "definition_override"
+        elif any(re.search(pattern, question_lower) for pattern in argument_overrides):
+            rule_name = "argument_override"
+        elif any(re.search(pattern, question_lower) for pattern in context_overrides):
+            rule_name = "context_override"
+        elif any(re.search(pattern, question_lower) for pattern in evidence_overrides):
+            rule_name = "evidence_override"
+        elif any(re.search(pattern, question_lower) for pattern in analogy_overrides):
+            rule_name = "analogy_override"
+        
+        # Create a result object with all the metadata
+        result = {
+            "category": predicted_category,
+            "confidence_scores": all_scores,
+            "method": "rule_based",
+            "rule_name": rule_name
+        }
+        
+        return result
     
     # No strong rule match, continue with ML approach
     question_lower = question.lower()
@@ -168,6 +209,7 @@ def classify_question(question: str, model_name: str = "facebook/bart-large-mnli
     
     # For multi-classification, combine all results with custom templates
     all_scores = {}
+    raw_scores = {}
     
     # Run classification once for each category with its specific template
     for category, template in category_templates.items():
@@ -178,6 +220,7 @@ def classify_question(question: str, model_name: str = "facebook/bart-large-mnli
         )
         # Store the score for this category
         all_scores[category] = result["scores"][0]
+        raw_scores[category] = result["scores"][0]  # Keep original scores
     
     # Apply stronger heuristic boosts based on pattern matches
     if has_definition_pattern:
@@ -199,10 +242,23 @@ def classify_question(question: str, model_name: str = "facebook/bart-large-mnli
     # Return the category with the highest score
     predicted_category = max(all_scores, key=all_scores.get)
     
-    # For debugging
-    # print(f"Scores: {all_scores}")
+    # Create a result object with all the metadata
+    result = {
+        "category": predicted_category,
+        "confidence_scores": all_scores,
+        "raw_scores": raw_scores,
+        "method": "zero_shot",
+        "applied_boosts": {
+            "definition_pattern": has_definition_pattern,
+            "argument_pattern": has_argument_pattern,
+            "context_pattern": has_context_pattern,
+            "evidence_pattern": has_evidence_pattern,
+            "analogy_pattern": has_analogy_pattern,
+            "what_causes_special_case": bool(re.search(r"what causes|what caused", question_lower))
+        }
+    }
     
-    return predicted_category
+    return result
 
 def get_example_questions() -> Dict[str, List[str]]:
     """
@@ -261,16 +317,34 @@ def test_classification(output_file: str = "output/classification_tests.json") -
     # Test all examples
     for category, questions in examples.items():
         for question in questions:
-            predicted = classify_question(question)
-            result = {
+            result = classify_question(question)
+            predicted = result["category"]
+            confidence_scores = result["confidence_scores"]
+            
+            test_result = {
                 "question": question,
                 "expected": category,
                 "predicted": predicted,
-                "correct": predicted == category
+                "correct": predicted == category,
+                "confidence_scores": confidence_scores,
+                "method": result["method"]
             }
-            results.append(result)
+            
+            # Add additional info based on method
+            if result["method"] == "rule_based":
+                test_result["rule_name"] = result["rule_name"]
+            else:
+                test_result["raw_scores"] = result["raw_scores"]
+                test_result["applied_boosts"] = result["applied_boosts"]
+            
+            results.append(test_result)
+            
+            # Get confidence for predicted category
+            confidence = confidence_scores[predicted]
+            confidence_display = f"{confidence:.2f}"
+            
             print(f"Question: {question}")
-            print(f"Expected: {category}, Predicted: {predicted}")
+            print(f"Expected: {category}, Predicted: {predicted} (Confidence: {confidence_display})")
             print(f"Correct: {predicted == category}")
             print("---")
     
@@ -279,10 +353,19 @@ def test_classification(output_file: str = "output/classification_tests.json") -
     total = len(results)
     accuracy = correct / total
     
+    # Calculate average confidence for correct and incorrect predictions
+    confidence_correct = [r["confidence_scores"][r["predicted"]] for r in results if r["correct"]]
+    confidence_incorrect = [r["confidence_scores"][r["predicted"]] for r in results if not r["correct"]]
+    
+    avg_confidence_correct = sum(confidence_correct) / len(confidence_correct) if confidence_correct else 0
+    avg_confidence_incorrect = sum(confidence_incorrect) / len(confidence_incorrect) if confidence_incorrect else 0
+    
     summary = {
         "total_questions": total,
         "correct_predictions": correct,
         "accuracy": accuracy,
+        "avg_confidence_correct": avg_confidence_correct,
+        "avg_confidence_incorrect": avg_confidence_incorrect,
         "results": results
     }
     
@@ -295,6 +378,8 @@ def test_classification(output_file: str = "output/classification_tests.json") -
     
     print(f"Classification test results saved to {output_file}")
     print(f"Accuracy: {accuracy:.2f} ({correct}/{total})")
+    print(f"Avg Confidence (Correct): {avg_confidence_correct:.2f}")
+    print(f"Avg Confidence (Incorrect): {avg_confidence_incorrect:.2f}")
 
 def test_specific_patterns() -> None:
     """
@@ -313,13 +398,17 @@ def test_specific_patterns() -> None:
     
     all_correct = True
     for question in test_questions:
-        category = classify_question(question)
+        result = classify_question(question)
+        category = result["category"]
+        confidence = result["confidence_scores"][category]
+        method = result["method"]
+        
         is_correct = category == "Argument"
         all_correct = all_correct and is_correct
         
         status = "✓" if is_correct else "✗"
         print(f"{status} Question: {question}")
-        print(f"  Predicted: {category}")
+        print(f"  Predicted: {category} (Confidence: {confidence:.2f}, Method: {method})")
         print(f"  Expected: Argument")
         print(f"  Correct: {is_correct}")
         print("-" * 50)
@@ -347,9 +436,18 @@ def main():
     elif args.test_patterns:
         test_specific_patterns()
     elif args.question:
-        category = classify_question(args.question, args.model)
+        result = classify_question(args.question, args.model)
+        category = result["category"]
+        confidence = result["confidence_scores"][category]
+        method = result["method"]
+        
         print(f"Question: {args.question}")
-        print(f"Category: {category}")
+        print(f"Category: {category} (Confidence: {confidence:.2f}, Method: {method})")
+        
+        if method == "zero_shot":
+            print("All confidence scores:")
+            for cat, score in sorted(result["confidence_scores"].items(), key=lambda x: x[1], reverse=True):
+                print(f"  {cat}: {score:.4f}")
     else:
         parser.print_help()
 

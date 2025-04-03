@@ -9,6 +9,9 @@ on a sample set of questions with expected keywords.
 import os
 import sys
 import json
+import csv
+import time
+import datetime
 from typing import List, Dict, Any
 from colorama import init, Fore, Style
 
@@ -120,6 +123,80 @@ def generate_feedback(question_type_correct: bool, keyword_coverage: float, rele
     
     return "; ".join(feedback)
 
+def log_evaluation_result(result: Dict[str, Any], output_dir: str = "output/logs") -> None:
+    """
+    Log evaluation result to JSONL file for later analysis
+    
+    Args:
+        result: Result dictionary to log
+        output_dir: Directory to save logs
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a timestamped log file if it doesn't exist
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    log_file = os.path.join(output_dir, f"eval_results_{timestamp}.jsonl")
+    
+    # Add timestamp to the result
+    result["timestamp"] = datetime.datetime.now().isoformat()
+    
+    # Append to the log file
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(result) + '\n')
+
+def create_csv_summary(results: List[Dict[str, Any]], output_file: str = "output/evaluation_summary.csv") -> None:
+    """
+    Create a CSV summary of evaluation results
+    
+    Args:
+        results: List of evaluation results
+        output_file: Path to the output CSV file
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Define CSV columns
+    fieldnames = [
+        "Question", 
+        "Expected Type", 
+        "Predicted Type", 
+        "Type Correct?", 
+        "Classifier Confidence", 
+        "Classification Method",
+        "Top Passage Match Score",
+        "Reranked Match Score",
+        "Improvement",
+        "Matched Keywords", 
+        "Passage Relevant?",
+        "Overall Score",
+        "Feedback"
+    ]
+    
+    # Write CSV file
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for result in results:
+            writer.writerow({
+                "Question": result["question"],
+                "Expected Type": result["expected_type"],
+                "Predicted Type": result["predicted_type"],
+                "Type Correct?": "Yes" if result["type_correct"] else "No",
+                "Classifier Confidence": f"{result['classifier_confidence']:.2f}",
+                "Classification Method": result.get("classification_method", "N/A"),
+                "Top Passage Match Score": f"{result['original_keyword_coverage']:.2f}",
+                "Reranked Match Score": f"{result['reranked_keyword_coverage']:.2f}",
+                "Improvement": f"{result['reranked_keyword_coverage'] - result['original_keyword_coverage']:.2f}",
+                "Matched Keywords": ", ".join(result.get("matched_keywords", [])),
+                "Passage Relevant?": "Yes" if result.get("top_passage_relevant", False) else "No",
+                "Overall Score": f"{result['reranked_score']:.2f}",
+                "Feedback": result["feedback"]
+            })
+    
+    print(f"\nCSV summary saved to {output_file}")
+
 def evaluate_system() -> Dict[str, Any]:
     """
     Run the evaluation on the test questions
@@ -178,6 +255,13 @@ def evaluate_system() -> Dict[str, Any]:
     reranker_total_coverage = 0
     reranker_total_relevance = 0
     
+    # For CSV summary
+    detailed_results = []
+    
+    # Start timing for logging
+    start_time = time.time()
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     for i, test_case in enumerate(test_questions, 1):
         question = test_case["question"]
         expected_keywords = test_case["expected_keywords"]
@@ -186,14 +270,20 @@ def evaluate_system() -> Dict[str, Any]:
         print(f"\n{Fore.YELLOW}Question {i}/{total_questions}:{Style.RESET_ALL} {question}")
         print("-" * 60)
         
-        # Step 1: Classify the question
-        predicted_type = classify_question(question)
+        # Step 1: Classify the question and get confidence scores
+        question_result = classify_question(question)
+        predicted_type = question_result["category"]
+        classification_method = question_result["method"]
+        confidence_scores = question_result["confidence_scores"]
+        classifier_confidence = confidence_scores[predicted_type]
+        
         type_correct = expected_type == "" or predicted_type == expected_type
         if type_correct:
             correct_types += 1
         
         type_result = f"{Fore.GREEN}Correct{Style.RESET_ALL}" if type_correct else f"{Fore.RED}Incorrect (Expected: {expected_type}){Style.RESET_ALL}"
         print(f"Predicted Type: {predicted_type} - {type_result}")
+        print(f"Classifier Confidence: {classifier_confidence:.2f} (Method: {classification_method})")
         
         # Step 2: Retrieve passages
         passages = retriever.retrieve_relevant_passages(
@@ -211,6 +301,8 @@ def evaluate_system() -> Dict[str, Any]:
             "expected_type": expected_type,
             "predicted_type": predicted_type,
             "type_correct": type_correct,
+            "classifier_confidence": classifier_confidence,
+            "classification_method": classification_method,
             "original_passages": [],
             "reranked_passages": []
         }
@@ -230,12 +322,15 @@ def evaluate_system() -> Dict[str, Any]:
         # Evaluate reranked top passage
         reranked_top_coverage = 0
         reranked_relevance = False
+        matched_keywords = []
         
         if reranked_passages:
             reranked_keyword_check = check_keyword_coverage(reranked_passages[0]["text"], expected_keywords)
             reranked_is_relevant = is_passage_relevant(reranked_passages[0]["text"], question)
             reranked_top_coverage = reranked_keyword_check["coverage"]
             reranked_relevance = reranked_is_relevant
+            matched_keywords = reranked_keyword_check["matched_keywords"]
+            
             if reranked_relevance:
                 reranker_total_relevance += 1
             
@@ -308,10 +403,53 @@ def evaluate_system() -> Dict[str, Any]:
         print(f"{Fore.CYAN}FEEDBACK: {feedback}{Style.RESET_ALL}")
         
         # Add to results
+        passage_result["original_keyword_coverage"] = original_top_coverage
+        passage_result["reranked_keyword_coverage"] = reranked_top_coverage
         passage_result["original_score"] = original_question_score
         passage_result["reranked_score"] = reranked_question_score
         passage_result["feedback"] = feedback
+        passage_result["top_passage_relevant"] = reranked_relevance
+        passage_result["matched_keywords"] = matched_keywords
+        
         results["questions"].append(passage_result)
+        
+        # Create detailed result for CSV summary
+        detailed_results.append({
+            "question": question,
+            "expected_type": expected_type,
+            "predicted_type": predicted_type,
+            "type_correct": type_correct,
+            "classifier_confidence": classifier_confidence,
+            "classification_method": classification_method,
+            "original_keyword_coverage": original_top_coverage,
+            "reranked_keyword_coverage": reranked_top_coverage,
+            "matched_keywords": matched_keywords,
+            "top_passage_relevant": reranked_relevance,
+            "reranked_score": reranked_question_score,
+            "feedback": feedback
+        })
+        
+        # Log individual question result to JSONL
+        log_result = {
+            "run_id": run_id,
+            "question_id": i,
+            "question": question,
+            "expected_type": expected_type,
+            "predicted_type": predicted_type,
+            "type_correct": type_correct,
+            "classifier_confidence": classifier_confidence,
+            "classification_method": classification_method,
+            "confidence_scores": confidence_scores,
+            "original_keyword_coverage": original_top_coverage,
+            "reranked_keyword_coverage": reranked_top_coverage,
+            "matched_keywords": matched_keywords,
+            "total_keywords": len(expected_keywords),
+            "top_passage_relevant": reranked_relevance,
+            "original_score": original_question_score,
+            "reranked_score": reranked_question_score,
+            "feedback": feedback
+        }
+        log_evaluation_result(log_result)
         
         # Update overall metrics
         total_coverage += original_top_coverage
@@ -334,6 +472,14 @@ def evaluate_system() -> Dict[str, Any]:
     
     # Add reranker results to the results dictionary
     results["reranker_metrics"] = reranker_results
+    
+    # Add run metadata
+    results["run_metadata"] = {
+        "run_id": run_id,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "duration_seconds": time.time() - start_time,
+        "num_questions": total_questions
+    }
     
     # Print overall results with comparison
     print(f"\n{Fore.CYAN}======================================{Style.RESET_ALL}")
@@ -386,6 +532,9 @@ def evaluate_system() -> Dict[str, Any]:
         json.dump(clean_results, f, indent=2)
     
     print(f"\nDetailed results saved to {output_file}")
+    
+    # Create CSV summary
+    create_csv_summary(detailed_results)
     
     return results
 
