@@ -19,6 +19,14 @@ import uuid
 import yaml
 import html
 
+# Set page configuration - MUST BE THE FIRST STREAMLIT COMMAND
+st.set_page_config(
+    page_title="TextMind - Ask Marx Anything",
+    page_icon="🧠",
+    layout="centered",
+    initial_sidebar_state="expanded"
+)
+
 # Ensure logs directory exists
 os.makedirs("logs", exist_ok=True)
 
@@ -46,6 +54,7 @@ from feedback_store import feedback_store
 from session_manager import session_manager
 from feedback_logger import log_feedback
 from refine_answer import refine_answer
+from utils.concept_map import render_concept_map
 
 # Load configuration if available
 CONFIG_FILE = "config.yaml"
@@ -74,14 +83,6 @@ DATA_FILE = config.get("data_file", "data/manifesto_new_with_concepts.jsonl")
 EMBEDDINGS_DIR = config.get("embeddings_dir", "output/embeddings_new")
 LOGS_DIR = config.get("logs_dir", "logs")
 FEEDBACK_LOG_FILE = config.get("feedback_log_file", "logs/feedback_log.csv")
-
-# Set page configuration
-st.set_page_config(
-    page_title="TextMind - Ask Marx Anything",
-    page_icon="🧠",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
 
 # Add custom CSS
 st.markdown("""
@@ -245,26 +246,36 @@ def load_retriever(data_file="data/manifesto_new_with_concepts.jsonl", output_di
 
 # Initialize answer generator
 @st.cache_resource
-def load_answer_generator(use_ollama=True, ollama_model="mistral"):
-    """Initialize the answer generator with appropriate settings"""
-    # Only use Transformers if explicitly requested and Ollama not available
-    use_transformers = not (use_ollama and OLLAMA_AVAILABLE)
+def load_answer_generator(_retriever, use_ollama=True, ollama_model="mistral", use_transformers=False):
+    """
+    Load the answer generator with caching
     
-    generator = AnswerGenerator(
-        use_llm=use_transformers,  # Use Transformers only if Ollama not used 
-        model_name="gpt2",         # Default Transformers model
-        use_ollama=use_ollama,     # Prefer Ollama if available
-        ollama_model=ollama_model  # Ollama model to use
-    )
-    
-    if use_ollama and OLLAMA_AVAILABLE:
-        logger.info(f"Using Ollama with model {ollama_model}")
-    elif use_transformers:
-        logger.info("Using Transformers for answer generation")
-    else:
-        logger.info("Using rule-based answer generation")
+    Args:
+        _retriever: TextRetriever instance (renamed to avoid hash issues with streamlit)
+        use_ollama: Whether to use Ollama model
+        ollama_model: Which Ollama model to use
+        use_transformers: Whether to use Transformers model
         
-    return generator
+    Returns:
+        AnswerGenerator instance
+    """
+    try:
+        logger.info(f"Initializing AnswerGenerator with model settings: use_ollama={use_ollama}, ollama_model={ollama_model}, use_transformers={use_transformers}")
+        
+        # Create answer generator
+        generator = AnswerGenerator(
+            use_llm=use_transformers,  # AnswerGenerator uses use_llm instead of use_transformers
+            model_name="gpt2",
+            use_ollama=use_ollama,
+            ollama_model=ollama_model,
+            retriever=_retriever  # Pass the retriever to AnswerGenerator
+        )
+        
+        return generator
+    except Exception as e:
+        logger.error(f"Error initializing answer generator: {str(e)}")
+        # Return a minimal generator that will display errors
+        return AnswerGenerator(use_llm=False, use_ollama=False, retriever=_retriever)
 
 def highlight_keywords(text: str, keywords: List[str]) -> str:
     """
@@ -380,13 +391,17 @@ def process_question(
     # Handle follow-up question through direct refinement if possible
     if is_follow_up and previous_interaction:
         try:
+            # Get the previous passage
+            previous_passage = previous_interaction.get('metadata', {}).get('passage_text', '')
+            
             # Use refine_answer to get a refined answer based on the previous interaction
             refined_answer = refine_answer(
                 original_question=previous_interaction.get('question', ''),
                 original_answer=previous_interaction.get('answer', ''),
                 follow_up_question=question,
                 model="ollama" if use_ollama else "rule",
-                ollama_model=ollama_model
+                ollama_model=ollama_model,
+                passage_text=previous_passage
             )
             
             # Clean the refined answer
@@ -466,6 +481,12 @@ def process_question(
             "confidence": confidence
         }
     
+    # Handle unknown question types with a generic intro message
+    unknown_intro = ""
+    if question_type == "Unknown":
+        from scripts.question_classifier import handle_unknown_question_type
+        unknown_intro = handle_unknown_question_type(question) + " "
+    
     # Augment query with conversation context for follow-up questions
     augmented_query = question
     if is_follow_up and conversation_context:
@@ -497,81 +518,105 @@ def process_question(
     
     # Step 5: Generate answer
     if not top_passage:
-        answer_data = {
-            "answer": "I couldn't find a relevant passage to answer your question.",
-            "confidence": 0.0,
-            "method": "fallback"
-        }
+        answer = "I couldn't find relevant information to answer your question."
+        answer_confidence = 0.0
+        generation_method = "default"
     else:
-        # Determine generation method based on settings
-        if use_ollama and OLLAMA_AVAILABLE:
-            method = "ollama"
-        elif use_transformers:
-            method = "llm"
+        # For Unknown question types, prefer ollama if available or fall back to rule-based
+        if question_type == "Unknown" and use_ollama:
+            generation_method = "ollama"
         else:
-            method = "rule"
-            
-        # Generate answer
+            # Default method selection
+            generation_method = "ollama" if use_ollama else "rule"
+            if use_transformers:
+                generation_method = "llm"  # Changed from "transformers" to "llm" to match AnswerGenerator's method naming
+        
+        # Debug log for document_chunks
+        if debug:
+            if 'document_chunks' in top_passage:
+                print(f"DEBUG: Document chunks available in top_passage with {len(top_passage['document_chunks'])} items")
+            else:
+                print("DEBUG: No document_chunks available in top_passage")
+        
+        # Return the answer with metadata
         answer_data = answer_generator.generate_answer(
             question=question,
             passage=top_passage,
             question_type=question_type,
-            method=method
+            method=generation_method,
+            include_passage_info=True
         )
+        
+        # Debug log for source_location
+        if debug:
+            print(f"DEBUG: Source location found: {answer_data.get('source_location', {}).get('found', False)}")
+            if 'source_location' in answer_data and answer_data['source_location'].get('found', False):
+                print(f"DEBUG: Source location section: {answer_data['source_location'].get('section', 'None')}")
+                print(f"DEBUG: Source location paragraph: {answer_data['source_location'].get('paragraph_index', 'None')}")
+                print(f"DEBUG: Source location concepts: {answer_data['source_location'].get('concepts', [])}")
+        
+        # Prepend the generic intro for unknown question types
+        if unknown_intro and answer_data.get("answer"):
+            answer_data["answer"] = unknown_intro + answer_data["answer"]
+        
+        # Extract the answer and confidence
+        answer = answer_data.get("answer", "No answer generated.")
+        answer_confidence = answer_data.get("confidence", 0.0)
+        generation_method = answer_data.get("method", generation_method)
+        source_location = answer_data.get("source_location", {"found": False})
     
-    # Calculate execution time
-    execution_time = (datetime.datetime.now() - start_time).total_seconds()
+    # Clean the answer (remove any HTML tags)
+    answer = strip_html_tags(answer)
     
-    # Add to session history
-    if session:
-        metadata = {
-            "question_type": question_type,
-            "method": answer_data.get("method", ""),
-            "passage_id": top_passage.get("paragraph_id", "") if top_passage else None,
-            "passage_text": top_passage.get("text", "") if top_passage else None,
-            "is_follow_up": is_follow_up,
-            "execution_time": execution_time
-        }
-        session.add_interaction(
-            question=question,
-            answer=answer_data.get("answer", ""),
-            question_type=question_type,
-            metadata=metadata
-        )
-    
-    # Prepare response
+    # Step 6: Create the response
     response = {
         "question": question,
         "question_type": question_type,
         "confidence": confidence,
-        "answer": answer_data.get("answer", ""),
-        "answer_confidence": answer_data.get("confidence", 0.0),
-        "generation_method": answer_data.get("method", ""),
-        "execution_time": execution_time,
+        "answer": answer,
+        "answer_confidence": answer_confidence,
+        "generation_method": generation_method,
+        "execution_time": (datetime.datetime.now() - start_time).total_seconds(),
         "is_follow_up": is_follow_up,
         "session_id": session.session_id if session else None,
         "passage": top_passage,
         "passage_info": {
-            "id": top_passage.get("paragraph_id", "") if top_passage else None,
-            "text": top_passage.get("text", "") if top_passage else None,
+            "id": top_passage.get("id", "") if top_passage else "",
+            "text": top_passage.get("text", "") if top_passage else "",
             "hybrid_score": top_passage.get("hybrid_score", 0.0) if top_passage else 0.0,
             "semantic_score": top_passage.get("score", 0.0) if top_passage else 0.0,
             "keyword_score": top_passage.get("keyword_score", 0.0) if top_passage else 0.0,
             "matched_keywords": top_passage.get("matched_keywords", []) if top_passage else []
         },
-        "all_passages": reranked_passages[:top_n] if reranked_passages else [],
+        "source_location": source_location,
+        "all_passages": reranked_passages,
         "ranking_explanation": ranking_explanation,
         "classification": classification,
         "debug": {
             "conversation_context": conversation_context,
-            "augmented_query": augmented_query if is_follow_up else None,
-            "retrieved_passages_count": len(passages),
-            "reranked_passages_count": len(reranked_passages) if reranked_passages else 0
+            "is_unknown_type": question_type == "Unknown",
+            "unknown_intro_used": bool(unknown_intro)
         }
     }
     
-    # Clean the response before returning
-    return clean_answer_text(response)
+    # Step 7: Add to session history
+    if session:
+        metadata = {
+            "question_type": question_type,
+            "method": generation_method,
+            "passage_id": top_passage.get("id", "") if top_passage else "",
+            "passage_text": top_passage.get("text", "") if top_passage else "",
+            "is_follow_up": is_follow_up,
+            "execution_time": response["execution_time"]
+        }
+        session.add_interaction(
+            question=question,
+            answer=answer,
+            question_type=question_type,
+            metadata=metadata
+        )
+    
+    return response
 
 def display_conversation_history(session):
     """
@@ -606,184 +651,267 @@ def display_conversation_history(session):
 # Replace the display_card and display_followup_card functions with direct Streamlit components
 def display_card(response):
     """
-    Display the question and answer using Streamlit components instead of HTML
-    
-    Args:
-        response: Response data containing question, answer, etc.
+    Display the answer card with question, answer, type, and feedback
     """
-    # Don't use HTML for display - use direct Streamlit components
-    st.markdown(f"**Question:** {response['question']}")
+    if not response:
+        return
+        
+    # Extract fields from response
+    question = response.get('question', '')
+    question_type = response.get('question_type', 'Unknown')
+    answer = response.get('answer', '')
+    confidence = response.get('confidence', 0)
+    generation_method = response.get('generation_method', '')
+    execution_time = response.get('execution_time', 0)
+    passage_id = response.get('passage_info', {}).get('id', '')
+    passage_text = response.get('passage_info', {}).get('text', '')
     
-    # Display the question type tag
-    st.markdown(f"<span class='question-tag'>{response['question_type']}</span>", unsafe_allow_html=True)
-    
-    # Display the answer in a styled container
-    with st.container():
-        st.markdown("### Answer:")
-        st.write(response['answer'])
-    
-    # Display the source
-    st.markdown("**Source:**")
-    
-    # Display the passage in a scrollable area
-    if response["passage_info"]["text"]:
-        st.markdown(f"<div class='source-passage'>{response['passage_info']['text']}</div>", unsafe_allow_html=True)
-        st.caption("Scroll to see more")
+    # Extract source location information if available
+    source_location = {}
+    if 'source_location' in response:
+        source_location = response.get('source_location', {})
     else:
-        st.info("No specific source passage found.")
-
+        # Check if it's nested under passage_info
+        source_location = response.get('passage_info', {}).get('source_location', {})
+    
+    # Format the card
+    st.markdown(f"### {question}")
+    
+    # Show answer with HTML cleanly stripped
+    st.markdown(answer)
+    
+    # Add a faint hint about the source with enhanced location information
+    if passage_text:
+        source_hint = f"*Source information from passage {passage_id}*"
+        
+        # Add location details if found
+        if source_location and source_location.get('found', False):
+            section = source_location.get('section', '')
+            paragraph_index = source_location.get('paragraph_index')
+            concepts = source_location.get('concepts', [])
+            
+            location_details = []
+            if section:
+                location_details.append(f"Section: {section}")
+            if paragraph_index is not None:
+                location_details.append(f"Paragraph: {paragraph_index}")
+            
+            if location_details:
+                source_hint += f" ({', '.join(location_details)})"
+            
+            # Add concepts if available
+            if concepts:
+                concept_list = ', '.join([f"#{c}" for c in concepts[:3]])  # Show up to 3 concepts
+                source_hint += f" | Concepts: {concept_list}"
+        
+        st.markdown(f"<div style='color: #666; font-size: 0.8em; margin-top: 0.5em; margin-bottom: 1em;'>{source_hint}</div>", unsafe_allow_html=True)
+    
+    # Format metadata as clean horizontal icons/badges
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if question_type and question_type != "Unknown":
+            user_friendly_type = question_type
+            st.markdown(f"📚 {user_friendly_type}")
+        
+    with col2:
+        if generation_method == "ollama":
+            method_label = "AI-Generated" 
+        elif generation_method == "transformers":
+            method_label = "ML-Generated"
+        elif generation_method == "rule":
+            method_label = "Rule-Based"
+        elif generation_method == "refinement":
+            method_label = "Refined Answer"
+        else:
+            method_label = "Generated"
+            
+        st.markdown(f"🤖 {method_label}")
+        
+    with col3:
+        if execution_time:
+            st.markdown(f"⏱️ {execution_time:.2f}s")
+    
+    # Add thumbs up/down feedback
+    col_feedback1, col_feedback2, _ = st.columns([1, 1, 4])
+    
+    with col_feedback1:
+        st.button("👍", key=f"thumbs_up_{question}", help="This answer was helpful")
+        
+    with col_feedback2:
+        st.button("👎", key=f"thumbs_down_{question}", help="This answer wasn't helpful")
 
 def display_followup_card(response):
     """
-    Display a follow-up question and answer using Streamlit components
-    
-    Args:
-        response: Response data for the follow-up
+    Display a card for follow-up questions with original question-answer context
     """
-    # Don't use HTML for display - use direct Streamlit components
-    st.markdown(f"**Follow-up Question:** {response['question']}")
+    if not response or not response.get('debug', {}).get('refinement'):
+        return
+        
+    original_question = response.get('debug', {}).get('original_question', '')
+    original_answer = response.get('debug', {}).get('original_answer', '')
     
-    # Display the question type tag
-    st.markdown(f"<span class='question-tag'>{response['question_type']}</span>", unsafe_allow_html=True)
-    
-    # Display the answer in a styled container
-    with st.container():
-        st.markdown("### Answer:")
-        st.write(response['answer'])
-    
-    # Display the source
-    st.markdown("**Source:**")
-    
-    # Display the passage in a scrollable area
-    if response["passage_info"]["text"]:
-        st.markdown(f"<div class='source-passage'>{response['passage_info']['text']}</div>", unsafe_allow_html=True)
-        st.caption("Scroll to see more")
-    else:
-        st.info("No specific source passage found.")
+    if original_question and original_answer:
+        with st.expander("View original question and answer", expanded=False):
+            st.markdown(f"**Original Question:** {original_question}")
+            st.markdown(f"**Original Answer:** {original_answer}")
+            
+            # Add source hint if available
+            passage_text = response.get('passage_info', {}).get('text', '')
+            passage_id = response.get('passage_info', {}).get('id', '')
+            source_location = response.get('source_location', {})
+            
+            if passage_text:
+                source_hint = f"*Source information from passage {passage_id}*"
+                
+                # Add location details if found
+                if source_location and source_location.get('found', False):
+                    section = source_location.get('section', '')
+                    paragraph_index = source_location.get('paragraph_index')
+                    concepts = source_location.get('concepts', [])
+                    
+                    location_details = []
+                    if section:
+                        location_details.append(f"Section: {section}")
+                    if paragraph_index is not None:
+                        location_details.append(f"Paragraph: {paragraph_index}")
+                    
+                    if location_details:
+                        source_hint += f" ({', '.join(location_details)})"
+                    
+                    # Add concepts if available
+                    if concepts:
+                        concept_list = ', '.join([f"#{c}" for c in concepts[:3]])  # Show up to 3 concepts
+                        source_hint += f" | Concepts: {concept_list}"
+                
+                st.markdown(f"<div style='color: #666; font-size: 0.8em; margin-top: 0.5em;'>{source_hint}</div>", unsafe_allow_html=True)
 
 def main():
-    """Main app function"""
+    """Main application entry point"""
+    # Tabs for different features
+    tab_qa, tab_concept_map = st.tabs(["Ask Questions", "Concept Map"])
     
-    # Initialize resources
-    retriever = load_retriever(data_file=DATA_FILE, output_dir=EMBEDDINGS_DIR)
+    with tab_qa:
+        # Main Q&A interface
+        display_qa_interface()
     
-    # Initialize or retrieve session
-    if "session_id" not in st.session_state:
-        session = session_manager.create_session()
-        st.session_state.session_id = session.session_id
-    else:
-        session = session_manager.get_session(st.session_state.session_id)
-        if not session:
-            # Session expired or not found, create a new one
-            session = session_manager.create_session()
-            st.session_state.session_id = session.session_id
-    
-    # Initialize response state
-    if "last_response" not in st.session_state:
-        st.session_state.last_response = None
-        
-    # Initialize feedback state
-    if "feedback_submitted" not in st.session_state:
-        st.session_state.feedback_submitted = False
-    
-    # Main header
-    col1, col2, col3 = st.columns([1, 3, 1])
-    with col2:
-        st.markdown("""
-        <div class="header">
-            <h1>🧠 TextMind: Ask Marx Anything</h1>
-        </div>
-        """, unsafe_allow_html=True)
+    with tab_concept_map:
+        # Concept map visualization
+        render_concept_map()
 
-    # App introduction
+def display_qa_interface():
+    """Display the main Q&A interface"""
+    # Load the app header and style
+    st.title("TextMind: Ask Marx Anything")
     st.markdown("""
-    <div style="text-align: center; margin-bottom: 2rem;">
-        Explore the ideas from <em>The Communist Manifesto</em> through contextual questions and answers.
+    <div class='header-description'>
+        Ask questions about <em>The Communist Manifesto</em> by Karl Marx and Friedrich Engels
     </div>
     """, unsafe_allow_html=True)
     
-    # Generation style selector
-    gen_method_col1, gen_method_col2 = st.columns([3, 1])
-    with gen_method_col1:
-        generation_style = st.radio(
-            "Choose your answer style:",
-            options=["Smart & Balanced", "Simple & Direct", "Creative & Explorative"],
-            index=0,
-            horizontal=True
-        )
+    # Sidebar settings
+    st.sidebar.title("Settings")
     
-    # Map user-friendly terms to technical methods
-    if generation_style == "Smart & Balanced":
+    # Model selection in sidebar
+    use_ollama = False  # Default
+    use_transformers = False
+    ollama_model = DEFAULT_OLLAMA_MODEL
+    
+    model_option = st.sidebar.radio(
+        "Model for answer generation",
+        options=["Rule-based", "Ollama", "Transformers"],
+        index=0,
+        help="Select the model to use for generating answers"
+    )
+    
+    if model_option == "Ollama":
         use_ollama = True
-        use_transformers = False
-        ollama_model = DEFAULT_OLLAMA_MODEL
-    elif generation_style == "Simple & Direct":
-        use_ollama = False
-        use_transformers = False
-        ollama_model = DEFAULT_OLLAMA_MODEL
-    else:  # Creative & Explorative
-        use_ollama = False
-        use_transformers = True
-        ollama_model = DEFAULT_OLLAMA_MODEL
-    
-    # Initialize answer generator with selected method
-    answer_generator = load_answer_generator(
-        use_ollama=use_ollama,
-        ollama_model=ollama_model
-    )
-    
-    # Question input section
-    st.markdown("<div style='margin: 2rem 0 1rem 0;'></div>", unsafe_allow_html=True)
-    
-    user_question = st.text_input(
-        "Ask a question",
-        placeholder="Ask Marx a question...",
-        label_visibility="collapsed"
-    )
-    
-    st.markdown(
-        "<div style='text-align: center; font-size: 0.9rem; color: #666; margin-top: -0.5rem;'>"
-        "<em>We'll find the best answer from The Communist Manifesto.</em>"
-        "</div>",
-        unsafe_allow_html=True
-    )
-    
-    # Add a checkbox to mark as follow-up if there's a conversation history
-    is_follow_up = False
-    if session and session.history:
-        is_follow_up = st.checkbox(
-            "This is a follow-up to my previous question",
-            value=True if len(session.history) > 0 else False
+        ollama_model = st.sidebar.selectbox(
+            "Ollama model",
+            options=["mistral", "llama3", "llama2", "vicuna"],
+            index=0,
+            help="Select which Ollama model to use"
         )
+    elif model_option == "Transformers":
+        use_transformers = True
     
-    # Ask button
-    ask_col1, ask_col2, ask_col3 = st.columns([1, 1, 1])
-    with ask_col2:
-        ask_button = st.button("Ask", use_container_width=True, type="primary")
+    # Additional settings
+    use_reranker = st.sidebar.checkbox("Use passage reranking", value=True)
+    top_n = st.sidebar.slider("Number of passages to retrieve", min_value=1, max_value=10, value=MAX_PASSAGES)
     
-    # Advanced settings (collapsible)
-    with st.expander("Advanced Settings", expanded=False):
-        use_reranker = st.checkbox("Use hybrid reranking", value=True)
-        top_n = st.slider("Number of passages to retrieve", min_value=1, max_value=10, value=5)
+    # Load retriever and answer generator
+    retriever = load_retriever(DATA_FILE, EMBEDDINGS_DIR)
+    answer_generator = load_answer_generator(
+        _retriever=retriever,
+        use_ollama=use_ollama,
+        ollama_model=ollama_model,
+        use_transformers=use_transformers
+    )
+    
+    # Create or load session if enabled
+    session = None
+    if ENABLE_SESSION_MANAGEMENT:
+        # Get or create session ID
+        if "session_id" not in st.session_state:
+            st.session_state.session_id = str(uuid.uuid4())
         
-        # Show Ollama status if user wants to use it
-        if use_ollama:
-            if OLLAMA_AVAILABLE:
-                st.success("✅ Ollama is available")
-            else:
-                st.error("❌ Ollama is not available")
-                st.info("Falling back to rule-based generation")
+        session_id = st.session_state.session_id
+        session = session_manager.get_session(session_id)
         
-        # Show details about each generation style
+        if session:
+            logger.info(f"Loaded existing session: {session_id}")
+        else:
+            session = session_manager.create_session()
+            st.session_state.session_id = session.session_id
+            logger.info(f"Created new session: {session_id}")
+    
+    # Initialize state for feedback
+    if "feedback_submitted" not in st.session_state:
+        st.session_state.feedback_submitted = False
+    
+    if "last_response" not in st.session_state:
+        st.session_state.last_response = None
+    
+    # Question input
+    st.markdown("<div class='question-container'>", unsafe_allow_html=True)
+    
+    # Radio button for question type
+    is_follow_up = st.radio(
+        "Question type",
+        options=["New Question", "Follow-up Question"],
+        index=0,
+        horizontal=True,
+        help="Select if this is a new question or a follow-up to your previous question"
+    ) == "Follow-up Question"
+    
+    # Create a form for the question
+    with st.form(key="question_form"):
+        user_question = st.text_input(
+            "Ask a question about Marx's Communist Manifesto",
+            placeholder="e.g., What is class struggle according to Marx?",
+            key="question"
+        )
+        
+        ask_button = st.form_submit_button("Ask Question")
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Sample questions expander
+    with st.expander("Sample questions to try", expanded=False):
         st.markdown("""
-        #### Answer Generation Styles:
-        - **Smart & Balanced**: Uses Ollama LLM for nuanced, contextual answers (best quality).
-        - **Simple & Direct**: Uses rule-based templates for straightforward, factual answers (fastest).
-        - **Creative & Explorative**: Uses transformer models for more varied responses (experimental).
+        - **Definition**: What is the bourgeoisie?
+        - **Explanation**: How does Marx define communism?
+        - **Historical**: When was the Communist Manifesto written?
+        - **Analysis**: Why does Marx believe capitalism will collapse?
+        - **Evidence**: What examples does Marx provide for worker exploitation?
+        - **Comparison**: How does Marx compare capitalism to feudalism?
+        - **Concept**: What is class struggle?
+        - **Reasoning**: Why does Marx criticize the bourgeoisie?
+        - **Cause-Effect**: What causes revolution according to Marx?
         """)
-        
-        # Debug toggle (only if enabled in config)
-        show_debug = False
+    
+    # Debug mode toggle in expanded section
+    with st.sidebar.expander("Advanced Options", expanded=False):
         if ENABLE_DEBUG_MODE:
             show_debug = st.checkbox("Show debug information", value=False)
     
@@ -934,103 +1062,103 @@ def main():
             
             # Process the follow-up question
             with st.spinner("Processing follow-up..."):
-                follow_up_response = process_question(
-                    question=follow_up,
-                    retriever=retriever,
-                    answer_generator=answer_generator,
-                    session=session,
-                    use_ollama=use_ollama,
-                    ollama_model=ollama_model,
-                    use_transformers=use_transformers,
-                    use_reranker=use_reranker,
-                    top_n=top_n,
-                    is_follow_up=True,
-                    debug=ENABLE_DEBUG_MODE and show_debug
-                )
+                # Get the original response
+                original_response = st.session_state.last_response
+                original_question = original_response.get("question", "")
+                original_answer = original_response.get("answer", "")
+                original_passage = original_response.get("passage", {})
+                passage_text = original_response.get("passage_info", {}).get("text", "")
+                document_chunks = original_response.get("all_passages", [])
                 
-                # Clean the follow-up response before storing
-                follow_up_response = clean_answer_text(follow_up_response)
-                
-                # Store response in session state
-                st.session_state.last_response = follow_up_response
-            
-            # Display the follow-up answer
-            display_followup_card(follow_up_response)
-            
-            # Refresh the page to update conversation history
-            st.experimental_rerun()
-        
-        # Debug information if enabled
-        if ENABLE_DEBUG_MODE and show_debug:
-            with st.expander("Debug Information", expanded=False):
-                # Performance metrics
-                st.markdown("### Performance")
-                st.metric("Execution Time", f"{response['execution_time']:.2f} seconds")
-                
-                # Session info
-                st.markdown("### Session Info")
-                st.json({
-                    "session_id": session.session_id,
-                    "created_at": session.created_at,
-                    "interaction_count": len(session.history)
-                })
-                
-                # Classification info
-                st.markdown("### Question Classification")
-                st.json(response["classification"])
-                
-                # Reranking explanation
-                if response["ranking_explanation"]:
-                    st.markdown("### Reranking Explanation")
-                    st.json(response["ranking_explanation"])
-                
-                # Follow-up information if applicable
-                if response["is_follow_up"]:
-                    st.markdown("### Follow-up Context")
-                    st.text(response["debug"]["conversation_context"])
-                    st.markdown("#### Augmented Query")
-                    st.text(response["debug"]["augmented_query"])
-                
-                # Answer generation details
-                st.markdown("### Answer Generation")
-                generation_info = {
-                    "method": response['generation_method'],
-                    "confidence": response['answer_confidence'],
-                    "model": ollama_model if use_ollama else ("gpt2" if use_transformers else "rule-based")
-                }
-                st.json(generation_info)
-    
-    # If no response yet, show sample questions
-    if "last_response" not in st.session_state or not st.session_state.last_response:
-        st.markdown("<div style='margin-top: 3rem;'></div>", unsafe_allow_html=True)
-        
-        st.markdown("<div style='text-align: center; margin-bottom: 1rem;'><strong>Sample questions to try:</strong></div>", unsafe_allow_html=True)
-        
-        # Display sample questions as clickable buttons
-        samples_col1, samples_col2 = st.columns(2)
-        
-        with samples_col1:
-            st.markdown("""
-            - What is the bourgeoisie?
-            - How does Marx define communism?
-            - What is class struggle?
-            - Why does Marx criticize capitalism?
-            """)
-        
-        with samples_col2:
-            st.markdown("""
-            - When was the Communist Manifesto written?
-            - What examples of worker exploitation does Marx provide?
-            - How does Marx compare capitalism to feudalism?
-            - What causes revolution according to Marx?
-            """)
-    
-    # Footer
-    st.markdown("""
-    <div class="footer">
-        <p>Made with ❤️ for philosophical exploration | Powered by Ollama</p>
-    </div>
-    """, unsafe_allow_html=True)
+                # Check if we should use the refinement approach
+                if original_question and original_answer and passage_text:
+                    from refine_answer import refine_answer
+                    
+                    # Use the refine_answer function with source location support
+                    refined = refine_answer(
+                        original_question=original_question,
+                        original_answer=original_answer,
+                        follow_up_question=follow_up,
+                        model="ollama" if use_ollama else "rule",
+                        ollama_model=ollama_model,
+                        passage_text=passage_text,
+                        document_chunks=document_chunks,
+                        original_passage=original_passage
+                    )
+                    
+                    # Create a response with the refined answer
+                    follow_up_response = {
+                        "question": follow_up,
+                        "question_type": original_response.get("question_type", "Unknown"),
+                        "confidence": original_response.get("confidence", 0.0),
+                        "answer": refined.get("answer", ""),
+                        "answer_confidence": refined.get("confidence", 0.7),
+                        "generation_method": refined.get("method", "refinement"),
+                        "execution_time": 0.0,  # We're not measuring this separately
+                        "is_follow_up": True,
+                        "session_id": session.session_id if session else None,
+                        "passage": original_passage,
+                        "passage_info": original_response.get("passage_info", {}),
+                        "source_location": refined.get("source_location", {"found": False}),
+                        "all_passages": document_chunks,
+                        "debug": {
+                            "refinement": True,
+                            "original_question": original_question,
+                            "original_answer": original_answer,
+                            "conversation_context": f"Q: {original_question}\nA: {original_answer}\nFollow-up: {follow_up}"
+                        }
+                    }
+                    
+                    # Add to session history
+                    if session:
+                        metadata = {
+                            "question_type": original_response.get("question_type", "Unknown"),
+                            "method": refined.get("method", "refinement"),
+                            "passage_id": original_response.get("passage_info", {}).get("id", ""),
+                            "passage_text": passage_text,
+                            "is_follow_up": True,
+                            "refinement": True,
+                            "original_question": original_question,
+                            "execution_time": 0.0
+                        }
+                        session.add_interaction(
+                            question=follow_up,
+                            answer=refined.get("answer", ""),
+                            question_type=original_response.get("question_type", "Unknown"),
+                            metadata=metadata
+                        )
+                    
+                    # Store the response and display it
+                    st.session_state.last_response = follow_up_response
+                    
+                    # Display the follow-up response
+                    st.markdown("<hr>", unsafe_allow_html=True)
+                    display_card(follow_up_response)
+                else:
+                    # Fallback to regular question processing
+                    with st.spinner("Processing as new question..."):
+                        fallback_response = process_question(
+                            question=follow_up,
+                            retriever=retriever,
+                            answer_generator=answer_generator,
+                            session=session,
+                            use_ollama=use_ollama,
+                            ollama_model=ollama_model,
+                            use_transformers=use_transformers,
+                            use_reranker=use_reranker,
+                            top_n=top_n,
+                            is_follow_up=True,  # Mark as follow-up for context
+                            debug=ENABLE_DEBUG_MODE and show_debug
+                        )
+                        
+                        # Clean and store the response
+                        fallback_response = clean_answer_text(fallback_response)
+                        st.session_state.last_response = fallback_response
+                        
+                        # Display the follow-up response
+                        st.markdown("<hr>", unsafe_allow_html=True)
+                        display_card(fallback_response)
 
+# Run the main function
 if __name__ == "__main__":
     main() 
